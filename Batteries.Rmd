@@ -1,0 +1,316 @@
+---
+title: "Programowanie w R: Projekt - Analiza materiałów wykorzystywanych w produkcji baterii"
+author: "Michał Szmanda"
+date: "2024-11-25"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+---
+
+# Podsumowanie
+
+...
+
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(zoo)
+library(htmltools)
+library(caret)
+library(randomForest)
+## DT library for interactive tables
+library(DT)
+set.seed(12345)
+
+prettyTable <- function(table_df, round_digits=2, page_length=10, rownames=FALSE) {
+    DT::datatable(table_df, style="bootstrap", rownames = rownames, options = list(dom = 'Bfrtip', pageLength = page_length)) %>% formatRound(names(dplyr::select_if(table_df, is.numeric)), round_digits)
+}
+```
+
+# Wykorzystane biblioteki
+```{r, echo=FALSE}
+(.packages())
+```
+
+
+# Wczytainie i oczyszcenie danych
+
+1. Kod wyliczający wykorzystane biblioteki. 
+2. Kod zapewniający powtarzalność wyników przy każdym uruchomieniu raportu na tych 
+samych danych. 
+3. Kod pozwalający wczytać dane z pliku (mp_batteries.csv) 
+4. Kod przetwarzający brakujące dane. 
+5. Sekcję podsumowującą rozmiar zbioru i podstawowe statystyki.
+
+## Wczytanie danych
+```{r load_csv}
+data <- read.csv("mp_batteries.csv")
+prettyTable(head(data))
+```
+
+## Wartości ujemne
+Niektóre wpisy w bazie danych mają ujemne wartości napięcia, oraz przez to również energii. Przyjmując że nie ma dla nas znaczenia kierunek przepływu prądu, dla uproszczenia analizy zastąpiono je wartością bezwzględną
+
+```{r handling_negative}
+data$Average.Voltage <- abs(data$Average.Voltage)
+data$Gravimetric.Energy <- abs(data$Gravimetric.Energy)
+data$Volumetric.Energy <- abs(data$Volumetric.Energy)
+```
+
+## Przetworzanie brakujących danych
+
+```{r handling_missing}
+missing_count <- sum(colSums(is.na(data)))
+paste("missing values: ", missing_count)
+
+# Zastąpienie wartości NA, średnią dla kolumny
+data_clean <- data %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+clean_missing_count <- sum(colSums(is.na(data_clean)))
+paste("is cleaned:", clean_missing_count == 0)
+```
+
+# Podsumowanie danych
+```{r summarize_size, echo=FALSE}
+cat("Rozmiar zbioru danych:", nrow(data_clean), "wierszy i", ncol(data_clean), "kolumn.\n")
+```
+Krótki opis znaczenia numerycznych parametrów baterii
+
+1. `Max.Delta.Volume`: Największa różnica objętości podczas cyklu ładowania lub rozładowania.
+2. `Average.Voltage`: Średnie napięcie wyjściowe baterii w określonym okresie.
+3. `Gravimetric.Capacity`: Ilość ładunku, którą bateria może przechować na jednostkę masy.
+4. `Volumetric.Capacity`: Ilość ładunku, którą bateria może przechować na jednostkę objętości.
+5. `Gravimetric.Energy`: Zawartość energii w baterii na jednostkę masy.
+6. `Volumetric.Energy`: Zawartość energii w baterii na jednostkę objętości.
+7. `Atomic.Fraction.Charge`: Proporcja ładunku przypisanego do określonych gatunków atomowych podczas ładowania.
+8. `Atomic.Fraction.Discharge`: Proporcja ładunku przypisanego do określonych gatunków atomowych podczas rozładowania.
+9. `Stability.Charge`: Zdolność baterii do utrzymania wydajności podczas cykli ładowania.
+10. `Stability.Discharge`: Zdolność baterii do utrzymania wydajności podczas cykli rozładowania.
+11. `Steps`: Liczba dyskretnych etapów ładowania lub rozładowania w cyklu.
+12. `Max.Voltage.Step`: Najwyższe napięcie osiągnięte w jednym etapie procesu ładowania lub rozładowania.
+
+
+
+```{r summarize_numeric, echo=FALSE}
+numeric_cols <- data_clean[sapply(data_clean, is.numeric)]
+
+summary <- data.frame(
+  column_name = names(numeric_cols),
+  min = sapply(numeric_cols, min, na.rm = TRUE),
+  max = sapply(numeric_cols, max, na.rm = TRUE),
+  mean = sapply(numeric_cols, mean, na.rm = TRUE),
+  median = sapply(numeric_cols, median, na.rm = TRUE),
+  sd = sapply(numeric_cols, sd, na.rm = TRUE)
+)
+
+prettyTable(summary, 3, 50)
+```
+```{r summarize_distributions, echo=FALSE, include=FALSE}
+plots = list()
+for (i in seq_len(nrow(summary))) {
+  column_name <- summary$column_name[i]
+  mean_value <- summary$mean[i]
+  sd_value <- summary$sd[i]
+  
+  # Create the histogram of the column from data_clean
+  plot <- 
+    data_clean %>%
+    #filter(data_clean[column_name] != 0) %>%
+    ggplot(aes_string(x = column_name)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = "lightgray", color = "black") +
+    
+    # Overlay the normal distribution
+    stat_function(
+      fun = dnorm, 
+      args = list(mean = mean_value, sd = sd_value), 
+      color = "blue", 
+      size = 1
+    ) +
+    
+    # Labels and theme
+    labs(
+      title = paste("Histogram and Normal Distribution of", column_name),
+      x = "Value",
+      y = "Density"
+    ) +
+    theme_minimal()
+  
+  # Print the plot
+  plots[[i]] <- plot;
+  print(plot);
+}
+```
+
+```{r summarize_non_numeric, echo=FALSE}
+non_numeric_cols <- data_clean[!sapply(data_clean, is.numeric)]
+
+# Function to calculate the mode (most frequent value)
+calculate_mode <- function(x) {
+  if (length(unique(x)) == 0) return(NA) # Handle empty columns
+  tab <- table(x)
+  return(names(tab)[which.max(tab)])
+}
+
+# Create a summary dataframe for non-numeric columns
+non_numeric_summary <- data.frame(
+  column_name = names(non_numeric_cols),
+  unique_values = sapply(non_numeric_cols, function(x) length(unique(x))),
+  most_frequent_value = sapply(non_numeric_cols, calculate_mode),
+  stringsAsFactors = FALSE
+)
+
+prettyTable(non_numeric_summary, 3, 50)
+```
+
+Wybrane statystyki pogrupowane po aktywnym jonie.
+```{r summarize_active_ion, echo=FALSE}
+data_clean %>%
+  group_by(Working.Ion) %>%
+  summarise(
+    count = n(),
+    mean_voltage = mean(Average.Voltage),
+    mean_grav_energy = mean(Gravimetric.Energy)
+  ) %>%
+  arrange(desc(count)) %>%
+  prettyTable()
+```
+
+
+
+# Analiza danych
+
+## Znajdowanie korelacji
+
+```{r find_correlation}
+correlation_matrix <- cor(numeric_cols, use = "complete.obs")
+prettyTable(as.data.frame(correlation_matrix), 2, 100, TRUE)
+
+correlation_df <- 
+  correlation_matrix %>%
+  as.table() %>%
+  as.data.frame() %>%
+  rename(Correlation = Freq)
+
+correlation_df %>%
+  filter(as.character(Var1) > as.character(Var2)) %>%
+  arrange(desc(abs(Correlation))) %>%
+  head(5) %>%
+  prettyTable()
+
+```
+
+## Pojemność i Energia baterii
+
+Grawimetryczna energia i pojemność to kluczowe wskaźniki służące do oceny wydajności baterii. Chociaż są ze sobą powiązane, odnoszą się do różnych właściwości:
+
+---
+
+**Grawimetryczna gęstość energii (Wh/kg)** to ilość energii, jaką bateria może przechowywać na jednostkę masy. Uwzględnia zarówno pojemność, jak i nominalne napięcie baterii, odzwierciedlając całkowitą dostępną energię.
+
+  $$
+  \text{Gravimetric Energy Density}\left[\frac{\text{Wh}}{\text{kg}}\right] = \frac{\text{Voltage} \times \text{Capacity}}{\text{Weight}}
+  $$
+
+
+
+**Grawimetryczna pojemność (Ah/kg)**, czyli całkowity ładunek, jaki bateria może przechować na jednostkę masy. Koncentruje się wyłącznie na ilości przechowywanego ładunku, niezależnie od napięcia.
+
+  $$
+  \text{Gravimetric Capacity}\left[\frac{\text{Ah}}{\text{kg}}\right] = \frac{\text{Capacity}}{\text{Weight}}
+  $$
+
+---
+
+
+```{r, echo=FALSE}
+## Wykres zależności energi względem wagi i objętości
+plot_grav_vol_energy <- function (data_frame, title = "Scatterplot of Gravimetric vs Volumetric Energy") {
+ggplot(data_frame, aes(x = Gravimetric.Energy, y = Volumetric.Energy, color = Working.Ion)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_smooth(formula = y ~ x, method = "lm", se = FALSE, linetype = "dashed", linewidth = 1) +
+  #scale_x_log10() +
+  #scale_y_log10() +
+  labs(
+    title = title,
+    x = "Gravimetric Energy",
+    y = "Volumetric Energy",
+    color = "Working Ion"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),  # Center the title
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+}
+# plot_grav_vol_energy(data_clean)
+```
+
+```{r, echo=FALSE}
+five_popular_ions = c("Li", "Ca", "Mg", "Zn", "Na")
+
+data_clean %>%
+  filter(Working.Ion %in% five_popular_ions) %>%
+  filter(Volumetric.Energy < 7500) %>%
+  filter(Gravimetric.Energy < 1500) %>%
+  plot_grav_vol_energy("Correlation between Gravimetric and Volumetric Energy\n for 5 most popular working Ions")
+
+data_clean %>%
+  filter(!(Working.Ion %in% five_popular_ions)) %>%
+  filter(Volumetric.Energy < 7500) %>%
+  filter(Gravimetric.Energy < 1500) %>%
+  plot_grav_vol_energy("Correlation between Gravimetric and Volumetric Energy\n for other working Ions")
+```
+
+
+## Model for predicting Average.Voltage from other parameters
+
+```{r}
+train_indices <- createDataPartition(numeric_cols$Average.Voltage, p = 0.7, list = FALSE)
+data_train <- numeric_cols[train_indices, ]
+data_test <- numeric_cols[-train_indices, ]
+
+## linear model:
+# model <- lm(Average.Voltage ~ ., data = data_train)
+## random forest
+ctrl <- trainControl(
+    method = "repeatedcv", # repeated cross validation
+    number = 2,
+    repeats = 5)
+model <- train(Average.Voltage ~ .,
+             data = data_train,
+             method = "rf",
+             trControl = ctrl,
+             ntree = 10)
+# Summary of the model
+# summary(model)
+
+predictions <- predict(model, newdata = data_test)
+
+actual <- data_test$Average.Voltage
+mae <- mean(abs(predictions - actual))  # Mean Absolute Error
+mse <- mean((predictions - actual)^2)   # Mean Squared Error
+rmse <- sqrt(mse)                       # Root Mean Squared Error
+ 
+
+print(paste(
+  "Mean Absolute Error:", mae,
+  "Mean Squared Error:", mse,
+  "Root Mean Squared Error:", rmse
+))
+
+# Plot actual vs predicted values
+ggplot(data.frame(actual, predictions), aes(x = actual, y = predictions)) +
+  geom_point(alpha = 0.5, color= "orange") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Actual vs Predicted Average.Voltage",
+       x = "Actual Average.Voltage",
+       y = "Predicted Average.Voltage") +
+  theme_minimal()
+
+```
